@@ -3,18 +3,18 @@
 
 Usage:
     python manta_generate.py "AMINO_ACID_SEQUENCE" output.pdb
-
+    python MANTA_generation_rg_percent_v4.py \
+        "AMINO_ACID_SEQUENCE" output.pdb \
+        --target-rg 35 \
+        --num-frames 1000 \
+        --rg-std-scale 150
+        
 Required repository layout:
     manta_generate.py
     weght/MANTA.pth
 """
 
 import os
-os.environ.setdefault('OMP_NUM_THREADS', '16')
-os.environ.setdefault('OPENBLAS_NUM_THREADS', '16')
-os.environ.setdefault('MKL_NUM_THREADS', '16')
-os.environ.setdefault('VECLIB_MAXIMUM_THREADS', '16')
-os.environ.setdefault('NUMEXPR_NUM_THREADS', '16')
 import argparse
 import gc
 import hashlib
@@ -43,7 +43,8 @@ DEFAULT_DEVICE = 'cuda'
 RG_BASE_CALIB_SCALE = 1.0
 RG_OPTUNA_MEAN_SCALE = 1.1101784249260092
 RG_MEAN_SCALE = RG_BASE_CALIB_SCALE * RG_OPTUNA_MEAN_SCALE
-RG_STD_SCALE = 0.3
+RG_STD_BASE_SCALE = 0.30
+DEFAULT_RG_STD_PERCENT = 100.0
 APPLY_RG_CALIBRATION = True
 DECODER_LAM = 275.7386526647752
 DECODER_P = 6.91537362718835
@@ -443,14 +444,45 @@ def save_raw_ca_ensemble(coordinates_ensemble: np.ndarray, model_info: Probabili
     io.set_structure(structure)
     io.save(str(output_path))
 
-def decode_to_pdb(pred_dict: dict, sequence: str, target_name: str, output_pdb: Path, device: torch.device) -> dict:
+def decode_to_pdb(
+    pred_dict: dict,
+    sequence: str,
+    target_name: str,
+    output_pdb: Path,
+    device: torch.device,
+    target_rg_override: float | None = None,
+    num_frames: int = DEFAULT_NUM_FRAMES,
+    rg_std_percent: float = DEFAULT_RG_STD_PERCENT,
+) -> dict:
+    if int(num_frames) <= 0:
+        raise ValueError('num_frames must be a positive integer.')
+    num_frames = int(num_frames)
+
+    rg_std_percent = float(rg_std_percent)
+    if not np.isfinite(rg_std_percent) or rg_std_percent < 0:
+        raise ValueError('rg_std_percent must be a finite non-negative value.')
+    rg_std_internal_scale = RG_STD_BASE_SCALE * (rg_std_percent / 100.0)
+
     total_start = time.perf_counter()
     cfg = EncoderConfig()
     model = ProbabilisticSparseLaplacianIDP.from_encoder_prediction(pred_dict=pred_dict, sequence=sequence, cfg=cfg)
-    raw_target_rg = max(float(model.get_target_rg(default=30.0, apply_calibration=False)), 0.001)
-    base_target_rg = max(raw_target_rg * RG_BASE_CALIB_SCALE, 0.001)
-    target_rg = max(raw_target_rg * RG_MEAN_SCALE, 0.001)
-    rg_std = max(base_target_rg * RG_STD_SCALE, 0.001)
+
+    target_rg_override = as_float_scalar(target_rg_override, default=None)
+
+    if target_rg_override is not None:
+        if target_rg_override <= 0:
+            raise ValueError('target_rg_override must be positive.')
+        raw_target_rg = max(float(target_rg_override), 0.001)
+        base_target_rg = raw_target_rg
+        target_rg = raw_target_rg
+        target_rg_source = 'external'
+    else:
+        raw_target_rg = max(float(model.get_target_rg(default=30.0, apply_calibration=False)), 0.001)
+        base_target_rg = max(raw_target_rg * RG_BASE_CALIB_SCALE, 0.001)
+        target_rg = max(raw_target_rg * RG_MEAN_SCALE, 0.001)
+        target_rg_source = 'sequence_predicted'
+
+    rg_std = base_target_rg * rg_std_internal_scale
     std_dev, _ = model.get_structural_variability_cached()
     residue_divergency = np.median(std_dev, axis=1)
     div_min = residue_divergency.min()
@@ -459,8 +491,8 @@ def decode_to_pdb(pred_dict: dict, sequence: str, target_name: str, output_pdb: 
     base_seed_offset = int(hashlib.md5(f'{target_name}_{DEFAULT_SEED}'.encode('utf-8')).hexdigest(), 16) % 2 ** 31
     valid_coordinates = []
     seed_offset = 0
-    while len(valid_coordinates) < DEFAULT_NUM_FRAMES:
-        needed = DEFAULT_NUM_FRAMES - len(valid_coordinates)
+    while len(valid_coordinates) < num_frames:
+        needed = num_frames - len(valid_coordinates)
         batch_size = min(DEFAULT_DECODER_BATCH_SIZE, needed)
         delta_list = []
         weight_list = []
@@ -480,9 +512,19 @@ def decode_to_pdb(pred_dict: dict, sequence: str, target_name: str, output_pdb: 
         del coordinates_batch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    raw_coordinates = np.asarray(valid_coordinates[:DEFAULT_NUM_FRAMES], dtype=np.float32)
+    raw_coordinates = np.asarray(valid_coordinates[:num_frames], dtype=np.float32)
     save_raw_ca_ensemble(coordinates_ensemble=raw_coordinates, model_info=model, output_path=output_pdb)
-    return {'raw_target_rg': raw_target_rg, 'target_mean_rg': target_rg, 'target_rg_std': rg_std, 'num_frames': DEFAULT_NUM_FRAMES, 'decoder_and_pdb_sec': time.perf_counter() - total_start}
+    return {
+        'target_rg_source': target_rg_source,
+        'target_rg_override': target_rg_override,
+        'raw_target_rg': raw_target_rg,
+        'target_mean_rg': target_rg,
+        'target_rg_std': rg_std,
+        'rg_std_percent': rg_std_percent,
+        'rg_std_internal_scale': rg_std_internal_scale,
+        'num_frames': num_frames,
+        'decoder_and_pdb_sec': time.perf_counter() - total_start,
+    }
 
 class SequenceToPDBPipeline:
 
@@ -492,7 +534,14 @@ class SequenceToPDBPipeline:
         self.extractor = DirectESM2Extractor(model_name=DEFAULT_ESM_MODEL, device=self.device)
         self.encoder = DirectEncoderPredictor(cfg=self.cfg, checkpoint_path=DEFAULT_ENCODER_CHECKPOINT, device=self.device)
 
-    def generate(self, sequence: str, output_pdb: Path) -> dict:
+    def generate(
+        self,
+        sequence: str,
+        output_pdb: Path,
+        target_rg_override: float | None = None,
+        num_frames: int = DEFAULT_NUM_FRAMES,
+        rg_std_percent: float = DEFAULT_RG_STD_PERCENT,
+    ) -> dict:
         sequence = re.sub('\\s+', '', str(sequence)).upper()
         output_pdb = Path(output_pdb).expanduser().resolve()
         if not sequence:
@@ -518,7 +567,16 @@ class SequenceToPDBPipeline:
         del attentions
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        decoder_info = decode_to_pdb(pred_dict=prediction, sequence=sequence, target_name=target_name, output_pdb=output_pdb, device=self.device)
+        decoder_info = decode_to_pdb(
+            pred_dict=prediction,
+            sequence=sequence,
+            target_name=target_name,
+            output_pdb=output_pdb,
+            device=self.device,
+            target_rg_override=target_rg_override,
+            num_frames=num_frames,
+            rg_std_percent=rg_std_percent,
+        )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         result = {'output_pdb': str(output_pdb), 'sequence_length': len(sequence), 'esm2_sec': esm_seconds, 'encoder_sec': encoder_seconds, **decoder_info, 'end_to_end_sec': time.perf_counter() - total_start}
@@ -528,9 +586,32 @@ class SequenceToPDBPipeline:
         return result
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Generate a 300-frame Cα-level IDP ensemble PDB from one amino-acid sequence.')
+    parser = argparse.ArgumentParser(description='Generate a Cα-level IDP ensemble PDB from one amino-acid sequence.')
     parser.add_argument('sequence', type=str, help='Protein sequence using the 20 standard one-letter amino-acid codes.')
     parser.add_argument('output_pdb', type=Path, help='Output multi-model PDB path.')
+    parser.add_argument(
+        '--target-rg',
+        type=float,
+        default=None,
+        help='External target Rg in Angstrom. If omitted, the sequence-predicted Rg is used.',
+    )
+    parser.add_argument(
+        '--num-frames',
+        type=int,
+        default=DEFAULT_NUM_FRAMES,
+        help=f'Number of conformers to generate. Default: {DEFAULT_NUM_FRAMES}.',
+    )
+    parser.add_argument(
+        '--rg-std-scale', '--rg-std-percent',
+        dest='rg_std_percent',
+        type=float,
+        default=DEFAULT_RG_STD_PERCENT,
+        help=(
+            'Relative Rg-distribution width in percent. '
+            '100 corresponds to the paper/default setting (internal RG_STD scale = 0.30); '
+            '50 gives 0.15 and 200 gives 0.60. Default: 100.'
+        ),
+    )
     return parser.parse_args()
 
 def print_summary(result: dict) -> None:
@@ -540,7 +621,10 @@ def print_summary(result: dict) -> None:
     print(f"Output PDB:       {result['output_pdb']}")
     print(f"Sequence length:  {result['sequence_length']}")
     print(f"Frames:           {result['num_frames']}")
+    print(f"Target Rg source: {result['target_rg_source']}")
     print(f"Target mean Rg:   {result['target_mean_rg']:.3f} Å")
+    print(f"Rg std width:     {result['rg_std_percent']:.1f}%")
+    print(f"Internal std scale:{result['rg_std_internal_scale']:.3f}")
     print(f"Target Rg std:    {result['target_rg_std']:.3f} Å")
     print(f"ESM-2:            {result['esm2_sec']:.3f} sec")
     print(f"Encoder:          {result['encoder_sec']:.3f} sec")
@@ -549,10 +633,46 @@ def print_summary(result: dict) -> None:
 
 def main() -> None:
     args = parse_arguments()
+
+    if args.num_frames <= 0:
+        raise ValueError('--num-frames must be a positive integer.')
+    if not np.isfinite(args.rg_std_percent) or args.rg_std_percent < 0:
+        raise ValueError('--rg-std-scale/--rg-std-percent must be a finite non-negative percentage.')
+
+    internal_rg_std_scale = RG_STD_BASE_SCALE * (args.rg_std_percent / 100.0)
+    print(f'Conformers to generate: {args.num_frames}')
+    print(f'Rg std width: {args.rg_std_percent:.1f}% (internal scale = {internal_rg_std_scale:.3f})')
+
+    if args.target_rg is not None:
+        if args.target_rg <= 0:
+            raise ValueError('--target-rg must be positive.')
+
+        print('\n' + '!' * 72)
+        print('WARNING: EXTERNAL Rg OVERRIDE ENABLED')
+        print('!' * 72)
+        print(f'External target Rg: {args.target_rg:.3f} Å')
+        print(
+            'An excessively small or large external Rg can force the generated '
+            'ensemble into strongly over-compact or over-extended conformations '
+            'and may produce distorted or nonphysical geometry.'
+        )
+        print(
+            'Use external Rg values only when the requested compactness is '
+            'physically meaningful for the target system.'
+        )
+        print('!' * 72)
+        input('Press Enter to continue, or Ctrl+C to cancel... ')
+
     seed_everything(DEFAULT_SEED)
     device = resolve_device()
     pipeline = SequenceToPDBPipeline(device=device)
-    result = pipeline.generate(sequence=args.sequence, output_pdb=args.output_pdb)
+    result = pipeline.generate(
+        sequence=args.sequence,
+        output_pdb=args.output_pdb,
+        target_rg_override=args.target_rg,
+        num_frames=args.num_frames,
+        rg_std_percent=args.rg_std_percent,
+    )
     print_summary(result)
 if __name__ == '__main__':
     main()
