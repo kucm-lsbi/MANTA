@@ -1,8 +1,10 @@
 # MANTA
 
-**MANTA** is a sequence-to-ensemble framework for generating Cα-level conformational ensembles of intrinsically disordered proteins (IDPs).
+<img src="asset/manta.png" width="150" align="right" alt="manta logo">
 
+**MANTA** is a sequence-to-ensemble framework for generating Cα-level conformational ensembles of intrinsically disordered proteins (IDPs).
 Given an amino-acid sequence, MANTA extracts ESM-2 representations, predicts sequence-derived geometric priors, and realizes multiple conformations using a confidence-weighted graph-based decoder with SMACOF optimization.
+
 
 ---
 
