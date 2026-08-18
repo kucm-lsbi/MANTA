@@ -11,7 +11,7 @@ Given an amino-acid sequence, MANTA extracts ESM-2 representations, predicts seq
 Clone the repository:
 
 ```bash
-git clone <REPOSITORY_URL>
+git clone https://github.com/kucm-lsbi/MANTA
 cd MANTA
 ```
 
