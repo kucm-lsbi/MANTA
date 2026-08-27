@@ -1,6 +1,7 @@
 # MANTA
 
 [![DOI](https://zenodo.org/badge/1323609465.svg)](https://doi.org/10.5281/zenodo.22122184)
+
 <img src="asset/manta.png" width="110" align="right" alt="manta logo">
 
 **MANTA** is a sequence-to-ensemble framework for generating Cα-level conformational ensembles of intrinsically disordered proteins (IDPs).
